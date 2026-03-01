@@ -11,6 +11,54 @@ export function xyToLatLon(x, y) {
   return [CENTER_LAT + y * SCALE, CENTER_LON + x * SCALE]
 }
 
+/** Inverse: (lat, lon) → (x, y) for building graphe from map-placed points. */
+export function latLonToXy(lat, lon) {
+  const y = (lat - CENTER_LAT) / SCALE
+  const x = (lon - CENTER_LON) / SCALE
+  return { x, y }
+}
+
+/**
+ * Build a GrapheRoutier from map state. Depot = id 0, collection points = 1..n, decharge = n+1 (if provided).
+ * If no depot or no points, returns null (caller should use buildSampleGraphe).
+ */
+export function buildGrapheFromMapState(depot, collectionPoints, decharge = null) {
+  if (!depot || !Array.isArray(collectionPoints) || collectionPoints.length === 0) return null
+  const graphe = new GrapheRoutier()
+  const [depotLat, depotLon] = depot
+  const { x: dx, y: dy } = latLonToXy(depotLat, depotLon)
+  graphe.ajouterSommet(new PointCollecte(0, dx, dy, 'Dépôt'))
+  collectionPoints.forEach((p, i) => {
+    const id = i + 1
+    const { x, y } = latLonToXy(p.lat, p.lon)
+    graphe.ajouterSommet(new PointCollecte(id, x, y, p.nom || `Point ${id}`))
+  })
+  let ids = [0, ...collectionPoints.map((_, i) => i + 1)]
+  if (decharge && Array.isArray(decharge) && decharge.length >= 2) {
+    const dechargeId = collectionPoints.length + 1
+    const { x, y } = latLonToXy(decharge[0], decharge[1])
+    graphe.ajouterSommet(new PointCollecte(dechargeId, x, y, 'Décharge'))
+    ids = [...ids, dechargeId]
+  }
+  ids.forEach((id1) => {
+    ids.forEach((id2) => {
+      if (id1 < id2) graphe.ajouterArete(id1, id2)
+    })
+  })
+  return graphe
+}
+
+/** Build default zones (one per collection point) for use with custom graphe. Uses point.poids as volume_estime. */
+export function buildZonesFromCollectionPoints(collectionPoints) {
+  if (!Array.isArray(collectionPoints) || collectionPoints.length === 0) return []
+  return collectionPoints.map((p, i) => {
+    const id = i + 1
+    const { x, y } = latLonToXy(p.lat, p.lon)
+    const volume = typeof p.poids === 'number' ? p.poids : 1000
+    return new Zone(id, [id], volume, x, y)
+  })
+}
+
 export function buildSampleGraphe() {
   const graphe = new GrapheRoutier()
 
