@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect } from 'react'
 import {
   GrapheRoutier,
   PointCollecte,
@@ -8,7 +8,7 @@ import {
   CreneauHoraire,
   ContrainteTemporelle,
   PlanificateurTriparti,
-  OptimiseurVRP,
+  Tournee,
   CapteurIoT,
   SimulateurTempsReel,
   OptimiseurMultiObjectif,
@@ -32,15 +32,6 @@ import { GEOAPIFY_API_KEY } from './config'
 
 const ROUTE_COLORS = ['#22c55e', '#2563eb', '#dc2626', '#f59e0b', '#8b5cf6', '#ec4899']
 
-/**
- * Scénario (aligné EcoRoute Optimizer) :
- * - Carte vide au démarrage.
- * - Placement libre : Dépôt, Décharge, Zone, Point sur la carte (ordre libre).
- * - Chaque point a un poids par défaut ; clic sur un point pour l'ajuster.
- * - Points de collecte : à l'intérieur de la zone (zone requise). Dépôt/décharge : position libre.
- * - Calcul des chemins : uniquement via le bouton "Calculer les chemins" ; N camions → N chemins.
- */
-
 /** Distance en mètres entre deux points (lat, lon) via Haversine. */
 function distanceHaversine(lat1, lon1, lat2, lon2) {
   const R = 6371000
@@ -59,10 +50,7 @@ function estDansZone(lat, lon, zone) {
   return d <= (zone.radius ?? 500)
 }
 
-/**
- * Distance routière entre deux coordonnées, avec cache local.
- * Fallback: distance Haversine si l'API ne renvoie pas de valeur.
- */
+/** Optimisation rapide de l'ordre des waypoints via distances géodésiques locales. */
 async function optimiseWaypointsRoadOrder(_apiKey, waypoints, _cache) {
   if (!Array.isArray(waypoints) || waypoints.length <= 3) return waypoints
   const start = waypoints[0]
@@ -95,57 +83,6 @@ async function optimiseWaypointsRoadOrder(_apiKey, waypoints, _cache) {
     d += distEnd[order[order.length - 1]]
     return d
   }
-
-  const exactLimit = 11
-  if (m <= exactLimit) {
-    const size = 1 << m
-    const dp = Array.from({ length: size }, () => Array(m).fill(Infinity))
-    const parent = Array.from({ length: size }, () => Array(m).fill(-1))
-
-    for (let i = 0; i < m; i += 1) dp[1 << i][i] = distStart[i]
-
-    for (let mask = 1; mask < size; mask += 1) {
-      for (let last = 0; last < m; last += 1) {
-        if ((mask & (1 << last)) === 0) continue
-        const cur = dp[mask][last]
-        if (!Number.isFinite(cur)) continue
-        for (let nxt = 0; nxt < m; nxt += 1) {
-          if (mask & (1 << nxt)) continue
-          const nextMask = mask | (1 << nxt)
-          const cand = cur + distMid[last][nxt]
-          if (cand < dp[nextMask][nxt] - 1e-9) {
-            dp[nextMask][nxt] = cand
-            parent[nextMask][nxt] = last
-          }
-        }
-      }
-    }
-
-    const full = size - 1
-    let bestLast = -1
-    let bestTotal = Infinity
-    for (let last = 0; last < m; last += 1) {
-      const total = dp[full][last] + distEnd[last]
-      if (total < bestTotal - 1e-9) {
-        bestTotal = total
-        bestLast = last
-      }
-    }
-    if (bestLast >= 0) {
-      const order = []
-      let mask = full
-      let cur = bestLast
-      while (cur >= 0) {
-        order.push(cur)
-        const prev = parent[mask][cur]
-        mask ^= 1 << cur
-        cur = prev
-      }
-      order.reverse()
-      return [start, ...order.map((i) => middle[i]), end]
-    }
-  }
-
   const remaining = new Set(Array.from({ length: m }, (_, i) => i))
   let cur = -1
   const nnOrder = []
@@ -169,12 +106,12 @@ async function optimiseWaypointsRoadOrder(_apiKey, waypoints, _cache) {
   let bestDistance = routeDist(bestOrder)
   let improved = true
   let pass = 0
-  const maxPasses = m <= 30 ? 12 : m <= 80 ? 6 : 3
+  const maxPasses = m <= 30 ? 4 : 2
   while (improved && pass < maxPasses) {
     pass += 1
     improved = false
     for (let i = 0; i < bestOrder.length - 1; i += 1) {
-      for (let k = i + 1; k < bestOrder.length; k += 1) {
+      for (let k = i + 1; k < Math.min(bestOrder.length, i + 8); k += 1) {
         const candidate = [
           ...bestOrder.slice(0, i),
           ...bestOrder.slice(i, k + 1).reverse(),
@@ -191,6 +128,66 @@ async function optimiseWaypointsRoadOrder(_apiKey, waypoints, _cache) {
   }
 
   return [start, ...bestOrder.map((i) => middle[i]), end]
+}
+
+function buildFastTournees(graphe, camions, pointIdsSansDepot, dechargeId = null) {
+  const depotId = 0
+  const depot = graphe.sommets.get(depotId)
+  if (!depot) return []
+
+  const pointsWithAngle = pointIdsSansDepot
+    .map((pid) => {
+      const p = graphe.sommets.get(pid)
+      if (!p) return null
+      const angle = Math.atan2(p.y - depot.y, p.x - depot.x)
+      return { pid, angle }
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.angle - b.angle)
+
+  const K = Math.max(1, camions.length)
+  const n = pointsWithAngle.length
+  const base = Math.floor(n / K)
+  const rem = n % K
+  const clusters = Array.from({ length: K }, () => [])
+  let idx = 0
+  for (let k = 0; k < K; k += 1) {
+    const size = base + (k < rem ? 1 : 0)
+    for (let j = 0; j < size; j += 1) {
+      clusters[k].push(pointsWithAngle[idx].pid)
+      idx += 1
+    }
+  }
+
+  const d = (a, b) => graphe.plusCourtChemin(a, b).distance
+  const endId = dechargeId ?? depotId
+
+  return clusters.map((cluster, k) => {
+    const camionId = camions[k]?.id ?? k + 1
+    if (cluster.length === 0) {
+      return new Tournee(camionId, [depotId, endId])
+    }
+    const remaining = new Set(cluster)
+    const tour = [depotId]
+    let current = depotId
+    while (remaining.size > 0) {
+      let best = null
+      let bestDist = Infinity
+      for (const pid of remaining) {
+        const dist = d(current, pid)
+        if (dist < bestDist) {
+          bestDist = dist
+          best = pid
+        }
+      }
+      if (best == null) break
+      tour.push(best)
+      remaining.delete(best)
+      current = best
+    }
+    tour.push(endId)
+    return new Tournee(camionId, tour)
+  })
 }
 
 const LEVELS = [
@@ -309,7 +306,7 @@ function App() {
     return { plan }
   }, [graphe, camions, zones, creneaux, contraintesTemporelles, currentLevel])
 
-  const niveau4 = useMemo(() => {
+  const computeNiveau4 = useCallback(() => {
     const dechargeId =
       decharge != null && graphe.sommets.has(pointsInZone.length + 1)
         ? pointsInZone.length + 1
@@ -317,10 +314,15 @@ function App() {
     const pointIdsSansDepot = Array.from(graphe.sommets.keys()).filter(
       (id) => id !== 0 && id !== (dechargeId ?? -1)
     )
-    const optimiseur = new OptimiseurVRP(graphe, camions)
-    const tournees = optimiseur.optimiser(pointIdsSansDepot, dechargeId)
+    const tournees = buildFastTournees(graphe, camions, pointIdsSansDepot, dechargeId)
     const distanceTotale = tournees.reduce((acc, t) => acc + t.calculerDistance(graphe), 0)
     return { tournees, distanceTotale }
+  }, [graphe, camions, decharge, pointsInZone.length])
+  const [niveau4, setNiveau4] = useState({ tournees: [], distanceTotale: 0 })
+
+  // Invalide les tournées pré-calculées quand les données changent (évite recalcul coûteux à chaque clic carte).
+  useEffect(() => {
+    setNiveau4({ tournees: [], distanceTotale: 0 })
   }, [graphe, camions, decharge, pointsInZone.length])
 
   const effectiveApiKey = apiKey?.trim() || GEOAPIFY_API_KEY
@@ -399,12 +401,15 @@ function App() {
     setRouteLoading(true)
     setRoutesHistory((h) => [...h, routesPerCamion])
     setRoutesPerCamion([])
-    try {      const results = []
+    try {
+      const computedNiveau4 = computeNiveau4()
+      setNiveau4(computedNiveau4)
+      const results = []
       let totalDistance = 0
       let totalTime = 0
       const repartition = []
-      for (let i = 0; i < niveau4.tournees.length; i++) {
-        const tournee = niveau4.tournees[i]
+      for (let i = 0; i < computedNiveau4.tournees.length; i++) {
+        const tournee = computedNiveau4.tournees[i]
         if (!tournee || tournee.points.length < 2) continue
         const rawWaypoints = tournee.points.map((id) => {
           const p = graphe.sommets.get(id)
@@ -439,7 +444,7 @@ function App() {
       const run = {
         id: Date.now(),
         date: new Date().toISOString(),
-        distanceTotale: niveau4.distanceTotale,
+        distanceTotale: computedNiveau4.distanceTotale,
         distanceKm: totalDistance / 1000,
         carburant: (totalDistance / 1000) * 0.05,
         duree: Math.round(totalTime / 60),
@@ -454,7 +459,7 @@ function App() {
     } finally {
       setRouteLoading(false)
     }
-  }, [effectiveApiKey, niveau4.tournees, niveau4.distanceTotale, graphe, routesPerCamion])
+  }, [effectiveApiKey, computeNiveau4, graphe, routesPerCamion])
 
   const viderCarte = useCallback(() => {
     setDepot(null)
@@ -480,6 +485,8 @@ function App() {
   }, [routesHistory.length])
 
   const exportPlan = useCallback(() => {
+    const niveau4ForExport =
+      niveau4.tournees.length > 0 ? niveau4 : computeNiveau4()
     const plan = {
       params: {
         nombreCamions,
@@ -501,7 +508,7 @@ function App() {
         nom: p.nom,
         poids: p.poids ?? 100,
       })) : undefined,
-      tournees: niveau4.tournees.map((t) => ({
+      tournees: niveau4ForExport.tournees.map((t) => ({
         camionId: t.camionId,
         points: t.points,
         distance: t.calculerDistance(graphe),
@@ -515,7 +522,7 @@ function App() {
     a.download = `plan-collecte-${Date.now()}.json`
     a.click()
     URL.revokeObjectURL(a.href)
-  }, [depot, decharge, userZones, collectionPoints, nombreCamions, capaciteParCamion, debutPlanification, finPlanification, debutPause, finPause, serviceDefautPoint, contrainteTemporelleOn, niveau4.tournees, graphe, routesPerCamion])
+  }, [depot, decharge, userZones, collectionPoints, nombreCamions, capaciteParCamion, debutPlanification, finPlanification, debutPause, finPause, serviceDefautPoint, contrainteTemporelleOn, niveau4, computeNiveau4, graphe, routesPerCamion])
 
   const importPlan = useCallback((file) => {
     const reader = new FileReader()
@@ -1032,6 +1039,8 @@ function App() {
 }
 
 export default App
+
+
 
 
 
